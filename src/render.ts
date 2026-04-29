@@ -1,148 +1,36 @@
-import * as Mp4Muxer from "mp4-muxer";
 import { Song, state } from "./main";
 
-async function loadImages(songs: Song[]): Promise<ImageBitmap[]> {
-  const promises = songs.map(async (song, index) => {
-    if (!song.coverArt) return createPlaceholderBitmap("No Image");
-
-    try {
-      // Stripping the -250/500 suffix to get original high-res quality
-      const highResUrl = song.coverArt.replace(/-(250|500|1200)(\.[a-z]+)?$/i, "$2");
-      const response = await fetch(highResUrl, { mode: 'cors', redirect: 'follow' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const blob = await response.blob();
-      return await createImageBitmap(blob);
-    } catch (err) {
-      console.error(`Failed to load: ${song.coverArt}`, err);
-      return createPlaceholderBitmap("Load Error");
-    }
-  });
-
-  return Promise.all(promises);
-}
-
-async function createPlaceholderBitmap(text: string): Promise<ImageBitmap> {
-  const canvas = new OffscreenCanvas(1080, 1080);
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#1a1a1a";
-  ctx.fillRect(0, 0, 1080, 1080);
-  ctx.fillStyle = "#ffffff";
-  ctx.font = "bold 40px sans-serif";
-  ctx.textAlign = "center";
-  ctx.fillText(text, 540, 540);
-  return canvas.transferToImageBitmap();
-}
-
 export async function exportVideo(): Promise<void> {
-  // 1080p Settings
-  const width = 1920; 
+  const width = 1920;
   const height = 1080;
-  const fps = 30;
-  const secondsPerSong = 5; // Longer duration as requested
-  const framesPerSlide = fps * secondsPerSong; 
-  
-  const songs = state.songList;
-  const totalFrames = songs.length * framesPerSlide;
-  const images = await loadImages(songs);
-
   const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext("2d")!;
 
-  const muxer = new Mp4Muxer.Muxer({
-    target: new Mp4Muxer.ArrayBufferTarget(),
-    video: { 
-        codec: "avc", 
-        width, 
-        height 
-    },
-    fastStart: "in-memory",
-  });
+  // 1. CLEAN THE DATA
+  // Vue Proxies cannot be sent to Workers. This turns them into a plain array.
+  const cleanSongs = JSON.parse(JSON.stringify(state.songList));
 
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: (e) => console.error(e),
-  });
+  const worker = new Worker(
+    new URL('./videoWorker.ts', import.meta.url), 
+    { type: 'module' }
+  );
 
-  // Level 4.1 is required for 1080p @ 30fps
-  videoEncoder.configure({
-    codec: "avc1.640028", 
+  // 2. SEND TO WORKER
+  worker.postMessage({
+    songs: cleanSongs,
     width,
     height,
-    bitrate: 5_000_000, // Higher bitrate for 1080p
-  });
+    fps: 30,
+    secondsPerSong: 5,
+    canvas: canvas // This is the OffscreenCanvas object
+  }, [canvas]); // Transfer the canvas ownership
 
-  for (let frameNumber = 0; frameNumber < totalFrames; frameNumber++) {
-    const songIndex = Math.floor(frameNumber / framesPerSlide);
-    const currentSong = songs[songIndex];
-    const currentImg = images[songIndex];
-
-    drawStylishSlide(ctx, currentImg, currentSong);
-
-    const timestamp = (frameNumber * 1e6) / fps;
-    const frame = new VideoFrame(canvas, { timestamp });
-    videoEncoder.encode(frame);
-    frame.close();
-
-    if (frameNumber % 30 === 0) {
-      await new Promise((r) => setTimeout(r, 0));
+  worker.onmessage = (e) => {
+    if (e.data.type === 'done') {
+      const blob = new Blob([e.data.buffer], { type: "video/mp4" });
+      downloadBlob(blob, "playlist.mp4");
+      worker.terminate();
     }
-  }
-
-  await videoEncoder.flush();
-  muxer.finalize();
-  downloadBlob(new Blob([muxer.target.buffer]), "album_preview.mp4");
-}
-
-function drawStylishSlide(
-  ctx: OffscreenCanvasRenderingContext2D, 
-  img: ImageBitmap, 
-  song: Song
-): void {
-  const { width, height } = ctx.canvas;
-
-  // 1. Draw Blurred Background (Stylish "Vibe" effect)
-  ctx.save();
-  ctx.filter = 'blur(40px) brightness(0.4)';
-  // Scale image to cover entire background
-  const scale = Math.max(width / img.width, height / img.height);
-  const bgW = img.width * scale;
-  const bgH = img.height * scale;
-  ctx.drawImage(img, (width - bgW) / 2, (height - bgH) / 2, bgW, bgH);
-  ctx.restore();
-
-  // 2. Draw Main Cover Art with Shadow
-  const padding = 100;
-  const cardHeight = height - (padding * 2);
-  const cardWidth = (img.width / img.height) * cardHeight;
-  const cardX = padding;
-  const cardY = padding;
-
-  ctx.shadowColor = 'rgba(0,0,0,0.5)';
-  ctx.shadowBlur = 30;
-  ctx.drawImage(img, cardX, cardY, cardWidth, cardHeight);
-  ctx.shadowBlur = 0; // Reset shadow
-
-  // 3. Stylish Text Placement
-  const textX = cardX + cardWidth + 60;
-  const centerY = height / 2;
-
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-
-  // Title
-  ctx.fillStyle = "white";
-  ctx.font = "bold 60px Inter, system-ui, sans-serif";
-  ctx.fillText(song.title.toUpperCase(), textX, centerY - 40);
-
-  // Artist
-  ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
-  ctx.font = "300 40px Inter, system-ui, sans-serif";
-  ctx.fillText(song.artist!, textX, centerY + 40);
-
-  // Album (Subtle)
-  ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
-  ctx.font = "italic 24px Inter, system-ui, sans-serif";
-  ctx.fillText(song.album!, textX, centerY + 100);
+  };
 }
 
 function downloadBlob(blob: Blob, filename: string): void {
@@ -152,4 +40,135 @@ function downloadBlob(blob: Blob, filename: string): void {
   a.download = filename;
   a.click();
   window.URL.revokeObjectURL(url);
+}
+
+
+
+async function getAudioSampleUrl(song: Song): Promise<string | null> {
+  const query = encodeURIComponent(`${song.artist} ${song.title}`);
+  try {
+    const response = await fetch(`https://itunes.apple.com/search?term=${query}&entity=song&limit=1`);
+    const data = await response.json();
+    if (data.results && data.results.length > 0) {
+      return data.results[0].previewUrl; // 30s MP3 link
+    }
+  } catch (e) {
+    console.error("iTunes fetch failed", e);
+  }
+  return null;
+}
+
+
+
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
+
+export async function exportVideoWithAudio(): Promise<void> {
+  const ffmpeg = new FFmpeg();
+  
+  // 1. Load FFmpeg
+  const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+  });
+
+  // 2. Get Video from your Worker (Existing Logic)
+  // Assume 'videoBuffer' is the ArrayBuffer returned by your worker
+  const videoBuffer = await runVideoWorker(); 
+  await ffmpeg.writeFile('input.mp4', new Uint8Array(videoBuffer));
+
+  // 3. Download and Prepare Audio
+  const songs = state.songList;
+  const audioParts: string[] = [];
+
+  for (let i = 0; i < songs.length; i++) {
+    const audioUrl = await getAudioSampleUrl(songs[i]);
+    if (audioUrl) {
+      const name = `audio${i}.mp3`;
+      await ffmpeg.writeFile(name, await fetchFile(audioUrl));
+      
+      // Trim audio to 5s to match slide duration
+      await ffmpeg.exec(['-i', name, '-t', '5', '-acodec', 'libmp3lame', `trimmed${i}.mp3`]);
+      audioParts.push(`file trimmed${i}.mp3`);
+    }
+  }
+
+  // 4. Concatenate Audio Parts
+  await ffmpeg.writeFile('concat.txt', audioParts.join('\n'));
+  await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'full_audio.mp3']);
+
+  // 5. Final Merge: Video + Audio
+  // -shortest ensures the video ends when the audio (or video) runs out
+  await ffmpeg.exec([
+    '-i', 'input.mp4', 
+    '-i', 'full_audio.mp3', 
+    '-c:v', 'copy', 
+    '-c:a', 'aac', 
+    '-map', '0:v:0', 
+    '-map', '1:a:0', 
+    '-shortest', 
+    'final_output.mp4'
+  ]);
+
+  // 6. Download
+  const data = await ffmpeg.readFile('final_output.mp4');
+  downloadBlob(new Blob([(data as any).buffer], { type: 'video/mp4' }), 'playlist_with_audio.mp4');
+}
+
+
+/**
+ * Triggers the Web Worker and returns a promise that resolves
+ * with the final MP4 ArrayBuffer.
+ */
+async function runVideoWorker(): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    // 1. Create the worker instance
+    // Note: The URL path depends on your build tool (Vite, Webpack, etc.)
+    const worker = new Worker(
+      new URL('./videoWorker.ts', import.meta.url), 
+      { type: 'module' }
+    );
+
+    // 2. Create the OffscreenCanvas
+    const width = 1920;
+    const height = 1080;
+    const canvas = new OffscreenCanvas(width, height);
+
+    // 3. Clean the data (Strip Vue/Framework Proxies)
+    const cleanSongs = JSON.parse(JSON.stringify(state.songList));
+
+    // 4. Send to worker
+    // The second argument [canvas] is the "Transfer List"
+    worker.postMessage({
+      songs: cleanSongs,
+      width,
+      height,
+      fps: 30,
+      secondsPerSong: 5,
+      canvas: canvas
+    }, [canvas]);
+
+    // 5. Handle messages from worker
+    worker.onmessage = (e) => {
+      const { type, p, buffer } = e.data;
+
+      if (type === 'progress') {
+        // You can link this to a reactive progress bar in your UI
+        console.log(`Video Render Progress: ${Math.round(p * 100)}%`);
+      }
+
+      if (type === 'done') {
+        console.log("Video frames rendered and muxed.");
+        worker.terminate(); // Clean up the worker thread
+        resolve(buffer);    // Return the ArrayBuffer to the caller
+      }
+    };
+
+    worker.onerror = (err) => {
+      console.error("Worker crashed:", err);
+      worker.terminate();
+      reject(err);
+    };
+  });
 }

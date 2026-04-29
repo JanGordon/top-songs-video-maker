@@ -3,7 +3,7 @@ import { isReactive, ref } from 'vue';
 import { Song, state } from '../main';
 import { MusicBrainzRecording, MusicBrainzRecordingResponse, Suggestion } from '../types';
 import SongCard from './songCard.vue';
-import { exportVideo } from '../render';
+import { exportVideo, exportVideoWithAudio } from '../render';
 
 var currentSuggestedSong = ref<{for: Song, suggestion: Suggestion} | null>(null)
 
@@ -100,7 +100,7 @@ function addSong() {
 
 let viewport = ref<HTMLCanvasElement | null>(null)
     function handleRender() {
-        exportVideo()
+        exportVideoWithAudio()
         // render(viewport.value!)
     }
 
